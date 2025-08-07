@@ -1,0 +1,21 @@
+{
+  "vin": "1HGBH41JXMN109186",
+  "manufacturer": "Honda",
+  "model": "Civic",
+  "fleet_id": "fleet_001",
+  "owner": "John Doe",
+  "registration_status": "Active"
+}
+
+POST /vehicles/1HGBH41JXMN109186/telemetry
+{
+  "vin": "1HGBH41JXMN109186",
+  "timestamp": "2024-01-15T10:30:00Z",
+  "latitude": 37.7749,
+  "longitude": -122.4194,
+  "speed": 65.0,
+  "engine_status": "running",
+  "fuel_level": 75.0,
+  "odometer": 15000.0,
+  "diagnostic_codes": []
+}
