@@ -1,0 +1,28 @@
+services:
+  # 1. FastAPI Backend Service
+  backend:
+    build:
+      context: . # Build context is the root directory
+      dockerfile: Dockerfile.backend # Dockerfile is also in the root
+    container_name: backend
+    ports:
+      - "8000:8000"
+    # Using your MongoDB Atlas URI
+    environment:
+      MONGO_URI: mongodb+srv://rakshanav2023_db_user:fbzjoQIYwLQtRVXY@cluster0.h6glgd5.mongodb.net/
+    restart: always
+
+  # 2. Next.js Frontend Service
+  frontend:
+    build:
+      context: ./frontend # Build context is the 'frontend' subdirectory
+      dockerfile: ../Dockerfile.frontend # Dockerfile is located one level up from the context
+    container_name: frontend
+    ports:
+      - "3000:3000"
+    depends_on:
+      - backend
+    environment:
+      # Use the backend service name 'backend' as the host name
+      NEXT_PUBLIC_API_URL: http://backend:8000
+    restart: always

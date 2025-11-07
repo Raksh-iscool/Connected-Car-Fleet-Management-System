@@ -35,7 +35,7 @@ deactivate () {
 # unset irrelevant variables
 deactivate nondestructive
 
-VIRTUAL_ENV="C:\Users\athar\Documents\VS_Code\motorqq\motorq\venv"
+VIRTUAL_ENV="C:\Users\ravrak\OneDrive\Sem3\intern\dbms\Connected-Car-Fleet-Management-System\venv"
 export VIRTUAL_ENV
 
 _OLD_VIRTUAL_PATH="$PATH"

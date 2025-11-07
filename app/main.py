@@ -1,231 +1,412 @@
 from fastapi import FastAPI, HTTPException, Query
-from typing import List, Dict, Optional
-from uuid import uuid4
-from datetime import datetime, timedelta
-
 from fastapi.responses import RedirectResponse
+from typing import List, Dict, Optional
+from datetime import datetime, timedelta
+from uuid import uuid4
 
-from app.models import Vehicle, TelemetryReading, Alert, AlertType
-from app.storage import vehicles, telemetry_log, alerts
+from app.models import (
+    Vehicle, TelemetryReading, Alert, AlertType, Severity,
+    Driver, Trip, Fleet, Owner, MaintenanceRecord
+)
+from app.database import (
+    vehicle_collection, telemetry_collection, alert_collection,
+    driver_collection, trip_collection, fleet_collection,
+    owner_collection, maintenance_collection, init_db
+)
+
+from fastapi.middleware.cors import CORSMiddleware
 
 app = FastAPI(title="Connected Car Fleet Management")
 
-# --- Configuration ---
-GLOBAL_SPEED_LIMIT = 100.0  # km/h
-LOW_FUEL_THRESHOLD = 15.0   # %
+# CORS configuration
+origins = [
+    "http://localhost",
+    "http://localhost:3000",
+    "http://127.0.0.1",
+    "http://127.0.0.1:3000",
+]
 
-def normalize_datetime(dt: datetime) -> datetime:
-    """Normalize datetime to UTC timezone for consistent comparison"""
-    from datetime import timezone
-    if dt.tzinfo is None:
-        return dt.replace(tzinfo=timezone.utc)
-    return dt.astimezone(timezone.utc)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=origins,
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
-# --- Vehicle CRUD ---
+# ---------------- Startup ----------------
+@app.on_event("startup")
+async def startup_event():
+    await init_db()
+
 @app.get("/", include_in_schema=False)
 async def root():
     return RedirectResponse(url="/docs")
 
+# ---------------- Vehicle CRUD ----------------
 @app.post("/vehicles", response_model=Vehicle)
-def create_vehicle(vehicle: Vehicle):
-    if vehicle.vin in vehicles:
-        raise HTTPException(400, "Vehicle already exists")
-    vehicles[vehicle.vin] = vehicle
-    telemetry_log[vehicle.vin] = []
+async def create_vehicle(vehicle: Vehicle):
+    # Check if vehicle with same VIN already exists
+    exists = await vehicle_collection.find_one({"vin": vehicle.vin})
+    if exists:
+        raise HTTPException(400, "Vehicle with this VIN already exists")
+    
+    # Convert to dict and remove None values
+    vehicle_dict = vehicle.dict(exclude_none=True)
+    await vehicle_collection.insert_one(vehicle_dict)
     return vehicle
 
 @app.get("/vehicles", response_model=List[Vehicle])
-def list_vehicles():
-    return list(vehicles.values())
+async def list_vehicles():
+    vehicles = await vehicle_collection.find().to_list(100)
+    return vehicles
 
 @app.get("/vehicles/{vin}", response_model=Vehicle)
-def get_vehicle(vin: str):
-    if vin not in vehicles:
+async def get_vehicle(vin: str):
+    vehicle = await vehicle_collection.find_one({"vin": vin})
+    if not vehicle:
         raise HTTPException(404, "Vehicle not found")
-    return vehicles[vin]
+    return vehicle
 
-@app.delete("/vehicles/{vin}", status_code=204)
-def delete_vehicle(vin: str):
-    if vin not in vehicles:
+@app.put("/vehicles/{vin}", response_model=Vehicle)
+async def update_vehicle(vin: str, vehicle: Vehicle):
+    result = await vehicle_collection.find_one_and_update(
+        {"vin": vin}, 
+        {"$set": vehicle.dict(exclude_none=True)}, 
+        return_document=True
+    )
+    if not result:
         raise HTTPException(404, "Vehicle not found")
-    del vehicles[vin]
-    telemetry_log.pop(vin, None)
-
-
-# --- Telemetry Ingestion & Retrieval ---
-def _generate_alerts(reading: TelemetryReading):
-    # Speed violation
-    if reading.speed > GLOBAL_SPEED_LIMIT:
-        alert = Alert(
-            id=str(uuid4()),
-            vin=reading.vin,
-            timestamp=reading.timestamp,
-            alert_type=AlertType.SpeedViolation,
-            message=f"Speed violation: {reading.speed} km/h > {GLOBAL_SPEED_LIMIT}",
-            severity="HIGH",
-        )
-        alerts[alert.id] = alert
-
-    # Low fuel/battery
-    if reading.fuel_level < LOW_FUEL_THRESHOLD:
-        alert = Alert(
-            id=str(uuid4()),
-            vin=reading.vin,
-            timestamp=reading.timestamp,
-            alert_type=AlertType.LowFuel,
-            message=f"Low fuel/battery: {reading.fuel_level}%",
-            severity="CRITICAL",
-        )
-        alerts[alert.id] = alert
-
-
-@app.post("/vehicles/{vin}/telemetry", response_model=TelemetryReading)
-def ingest_telemetry(vin: str, reading: TelemetryReading):
-    if vin not in vehicles:
-        raise HTTPException(404, "Vehicle not found")
-    # Override any mismatched VIN
-    reading.vin = vin
-    # Normalize timestamp to UTC
-    reading.timestamp = normalize_datetime(reading.timestamp)
-    telemetry_log[vin].append(reading)
-    _generate_alerts(reading)
-    return reading
-
-@app.post("/telemetry/batch", response_model=List[TelemetryReading])
-def ingest_batch(readings: List[TelemetryReading]):
-    stored = []
-    for r in readings:
-        if r.vin not in vehicles:
-            continue
-        # Normalize timestamp to UTC
-        r.timestamp = normalize_datetime(r.timestamp)
-        telemetry_log[r.vin].append(r)
-        _generate_alerts(r)
-        stored.append(r)
-    return stored
-
-@app.get("/vehicles/{vin}/telemetry/latest", response_model=TelemetryReading)
-def get_latest_telemetry(vin: str):
-    if vin not in telemetry_log or not telemetry_log[vin]:
-        raise HTTPException(404, "No telemetry found for this vehicle")
-    return max(telemetry_log[vin], key=lambda t: t.timestamp)
-
-@app.get("/vehicles/{vin}/telemetry/history", response_model=List[TelemetryReading])
-def get_telemetry_history(
-    vin: str,
-    start_time: Optional[datetime] = Query(None),
-    end_time: Optional[datetime] = Query(None),
-):
-    if vin not in telemetry_log:
-        raise HTTPException(404, "Vehicle not found")
-    records = telemetry_log[vin]
-    if start_time:
-        records = [r for r in records if r.timestamp >= start_time]
-    if end_time:
-        records = [r for r in records if r.timestamp <= end_time]
-    return records
-
-@app.get("/telemetry", response_model=Dict[str, List[TelemetryReading]])
-def get_multi_telemetry(
-    vins: Optional[str] = Query(None, description="Comma-separated VINs"),
-    start_time: Optional[datetime] = Query(None),
-    end_time: Optional[datetime] = Query(None),
-):
-    vin_list = vins.split(",") if vins else list(telemetry_log.keys())
-    result: Dict[str, List[TelemetryReading]] = {}
-    for vin in vin_list:
-        recs = telemetry_log.get(vin, [])
-        if start_time:
-            recs = [r for r in recs if r.timestamp >= start_time]
-        if end_time:
-            recs = [r for r in recs if r.timestamp <= end_time]
-        result[vin] = recs
     return result
 
+@app.delete("/vehicles/{vin}", status_code=204)
+async def delete_vehicle(vin: str):
+    result = await vehicle_collection.delete_one({"vin": vin})
+    if result.deleted_count == 0:
+        raise HTTPException(404, "Vehicle not found")
 
-# --- Alert Endpoints ---
+# ---------------- Telemetry ----------------
+@app.post("/vehicles/{vin}/telemetry", response_model=TelemetryReading)
+async def ingest_telemetry(vin: str, reading: TelemetryReading):
+    # Check if vehicle exists
+    vehicle = await vehicle_collection.find_one({"vin": vin})
+    if not vehicle:
+        raise HTTPException(404, "Vehicle not found")
+    
+    # Set the VIN and insert telemetry
+    reading.vin = vin
+    telemetry_dict = reading.dict(exclude_none=True)
+    await telemetry_collection.insert_one(telemetry_dict)
+
+    # Generate alerts based on telemetry
+    if reading.speed > 100:
+        alert = Alert(
+            vin=vin,
+            timestamp=reading.timestamp,
+            alert_type=AlertType.SpeedViolation,
+            message=f"Speed violation: {reading.speed} km/h > 100",
+            severity=Severity.HIGH
+        )
+        await alert_collection.insert_one(alert.dict(exclude_none=True))
+    
+    if reading.fuel_level < 20:
+        alert = Alert(
+            vin=vin,
+            timestamp=reading.timestamp,
+            alert_type=AlertType.LowFuel,
+            message=f"Low fuel level: {reading.fuel_level}%",
+            severity=Severity.MEDIUM
+        )
+        await alert_collection.insert_one(alert.dict(exclude_none=True))
+
+    return reading
+
+@app.get("/vehicles/{vin}/telemetry", response_model=List[TelemetryReading])
+async def get_vehicle_telemetry(
+    vin: str, 
+    limit: int = Query(50, ge=1, le=100)
+):
+    telemetry = await telemetry_collection.find(
+        {"vin": vin}
+    ).sort("timestamp", -1).limit(limit).to_list(limit)
+    return telemetry
+
+@app.get("/telemetry", response_model=List[TelemetryReading])
+async def list_telemetry(limit: int = Query(50, ge=1, le=100)):
+    telemetry = await telemetry_collection.find().sort("timestamp", -1).limit(limit).to_list(limit)
+    return telemetry
+
+# ---------------- Alerts ----------------
 @app.get("/alerts", response_model=List[Alert])
-def list_alerts():
-    return list(alerts.values())
+async def list_alerts(limit: int = Query(50, ge=1, le=100)):
+    alerts = await alert_collection.find().sort("timestamp", -1).limit(limit).to_list(limit)
+    return alerts
 
 @app.get("/alerts/{alert_id}", response_model=Alert)
-def get_alert(alert_id: str):
-    if alert_id not in alerts:
+async def get_alert(alert_id: str):
+    alert = await alert_collection.find_one({"_id": alert_id})
+    if not alert:
         raise HTTPException(404, "Alert not found")
-    return alerts[alert_id]
+    return alert
 
+@app.delete("/alerts/{alert_id}", status_code=204)
+async def delete_alert(alert_id: str):
+    result = await alert_collection.delete_one({"_id": alert_id})
+    if result.deleted_count == 0:
+        raise HTTPException(404, "Alert not found")
 
-# --- Fleet Analytics ---
-@app.get("/fleets/{fleet_id}/analytics")
-def fleet_analytics(fleet_id: str):
+# ---------------- Drivers ----------------
+@app.post("/drivers", response_model=Driver)
+async def create_driver(driver: Driver):
+    # Check if driver with same ID already exists
+    exists = await driver_collection.find_one({"driver_id": driver.driver_id})
+    if exists:
+        raise HTTPException(400, "Driver with this ID already exists")
+    
+    driver_dict = driver.dict(exclude_none=True)
+    await driver_collection.insert_one(driver_dict)
+    return driver
+
+@app.get("/drivers", response_model=List[Driver])
+async def list_drivers():
+    drivers = await driver_collection.find().to_list(100)
+    return drivers
+
+@app.get("/drivers/{driver_id}", response_model=Driver)
+async def get_driver(driver_id: str):
+    driver = await driver_collection.find_one({"driver_id": driver_id})
+    if not driver:
+        raise HTTPException(404, "Driver not found")
+    return driver
+
+@app.put("/drivers/{driver_id}", response_model=Driver)
+async def update_driver(driver_id: str, driver: Driver):
+    result = await driver_collection.find_one_and_update(
+        {"driver_id": driver_id}, 
+        {"$set": driver.dict(exclude_none=True)}, 
+        return_document=True
+    )
+    if not result:
+        raise HTTPException(404, "Driver not found")
+    return result
+
+@app.delete("/drivers/{driver_id}", status_code=204)
+async def delete_driver(driver_id: str):
+    result = await driver_collection.delete_one({"driver_id": driver_id})
+    if result.deleted_count == 0:
+        raise HTTPException(404, "Driver not found")
+
+# ---------------- Trips ----------------
+@app.post("/trips", response_model=Trip)
+async def create_trip(trip: Trip):
+    # Check if trip with same ID already exists
+    exists = await trip_collection.find_one({"trip_id": trip.trip_id})
+    if exists:
+        raise HTTPException(400, "Trip with this ID already exists")
+    
+    trip_dict = trip.dict(exclude_none=True)
+    await trip_collection.insert_one(trip_dict)
+    return trip
+
+@app.get("/trips", response_model=List[Trip])
+async def list_trips():
+    trips = await trip_collection.find().to_list(100)
+    return trips
+
+@app.get("/trips/{trip_id}", response_model=Trip)
+async def get_trip(trip_id: str):
+    trip = await trip_collection.find_one({"trip_id": trip_id})
+    if not trip:
+        raise HTTPException(404, "Trip not found")
+    return trip
+
+@app.put("/trips/{trip_id}", response_model=Trip)
+async def update_trip(trip_id: str, trip: Trip):
+    result = await trip_collection.find_one_and_update(
+        {"trip_id": trip_id}, 
+        {"$set": trip.dict(exclude_none=True)}, 
+        return_document=True
+    )
+    if not result:
+        raise HTTPException(404, "Trip not found")
+    return result
+
+@app.delete("/trips/{trip_id}", status_code=204)
+async def delete_trip(trip_id: str):
+    result = await trip_collection.delete_one({"trip_id": trip_id})
+    if result.deleted_count == 0:
+        raise HTTPException(404, "Trip not found")
+
+# ---------------- Fleets ----------------
+@app.post("/fleets", response_model=Fleet)
+async def create_fleet(fleet: Fleet):
+    # Check if fleet with same ID already exists
+    exists = await fleet_collection.find_one({"fleet_id": fleet.fleet_id})
+    if exists:
+        raise HTTPException(400, "Fleet with this ID already exists")
+    
+    fleet_dict = fleet.dict(exclude_none=True)
+    await fleet_collection.insert_one(fleet_dict)
+    return fleet
+
+@app.get("/fleets", response_model=List[Fleet])
+async def list_fleets():
+    fleets = await fleet_collection.find().to_list(100)
+    return fleets
+
+@app.get("/fleets/{fleet_id}", response_model=Fleet)
+async def get_fleet(fleet_id: str):
+    fleet = await fleet_collection.find_one({"fleet_id": fleet_id})
+    if not fleet:
+        raise HTTPException(404, "Fleet not found")
+    return fleet
+
+@app.put("/fleets/{fleet_id}", response_model=Fleet)
+async def update_fleet(fleet_id: str, fleet: Fleet):
+    result = await fleet_collection.find_one_and_update(
+        {"fleet_id": fleet_id}, 
+        {"$set": fleet.dict(exclude_none=True)}, 
+        return_document=True
+    )
+    if not result:
+        raise HTTPException(404, "Fleet not found")
+    return result
+
+@app.delete("/fleets/{fleet_id}", status_code=204)
+async def delete_fleet(fleet_id: str):
+    result = await fleet_collection.delete_one({"fleet_id": fleet_id})
+    if result.deleted_count == 0:
+        raise HTTPException(404, "Fleet not found")
+
+# ---------------- Owners ----------------
+@app.post("/owners", response_model=Owner)
+async def create_owner(owner: Owner):
+    # Check if owner with same ID already exists
+    exists = await owner_collection.find_one({"owner_id": owner.owner_id})
+    if exists:
+        raise HTTPException(400, "Owner with this ID already exists")
+    
+    owner_dict = owner.dict(exclude_none=True)
+    await owner_collection.insert_one(owner_dict)
+    return owner
+
+@app.get("/owners", response_model=List[Owner])
+async def list_owners():
+    owners = await owner_collection.find().to_list(100)
+    return owners
+
+@app.get("/owners/{owner_id}", response_model=Owner)
+async def get_owner(owner_id: str):
+    owner = await owner_collection.find_one({"owner_id": owner_id})
+    if not owner:
+        raise HTTPException(404, "Owner not found")
+    return owner
+
+@app.put("/owners/{owner_id}", response_model=Owner)
+async def update_owner(owner_id: str, owner: Owner):
+    result = await owner_collection.find_one_and_update(
+        {"owner_id": owner_id}, 
+        {"$set": owner.dict(exclude_none=True)}, 
+        return_document=True
+    )
+    if not result:
+        raise HTTPException(404, "Owner not found")
+    return result
+
+@app.delete("/owners/{owner_id}", status_code=204)
+async def delete_owner(owner_id: str):
+    result = await owner_collection.delete_one({"owner_id": owner_id})
+    if result.deleted_count == 0:
+        raise HTTPException(404, "Owner not found")
+
+# ---------------- Maintenance ----------------
+@app.post("/maintenance", response_model=MaintenanceRecord)
+async def create_maintenance(maintenance: MaintenanceRecord):
+    # Check if maintenance record with same ID already exists
+    exists = await maintenance_collection.find_one({"record_id": maintenance.record_id})
+    if exists:
+        raise HTTPException(400, "Maintenance record with this ID already exists")
+    
+    maintenance_dict = maintenance.dict(exclude_none=True)
+    await maintenance_collection.insert_one(maintenance_dict)
+    return maintenance
+
+@app.get("/maintenance", response_model=List[MaintenanceRecord])
+async def list_maintenance():
+    maintenance = await maintenance_collection.find().to_list(100)
+    return maintenance
+
+@app.get("/maintenance/{record_id}", response_model=MaintenanceRecord)
+async def get_maintenance(record_id: str):
+    maintenance = await maintenance_collection.find_one({"record_id": record_id})
+    if not maintenance:
+        raise HTTPException(404, "Maintenance record not found")
+    return maintenance
+
+@app.put("/maintenance/{record_id}", response_model=MaintenanceRecord)
+async def update_maintenance(record_id: str, maintenance: MaintenanceRecord):
+    result = await maintenance_collection.find_one_and_update(
+        {"record_id": record_id}, 
+        {"$set": maintenance.dict(exclude_none=True)}, 
+        return_document=True
+    )
+    if not result:
+        raise HTTPException(404, "Maintenance record not found")
+    return result
+
+@app.delete("/maintenance/{record_id}", status_code=204)
+async def delete_maintenance(record_id: str):
+    result = await maintenance_collection.delete_one({"record_id": record_id})
+    if result.deleted_count == 0:
+        raise HTTPException(404, "Maintenance record not found")
+
+# ---------------- Analytics & Dashboard ----------------
+@app.get("/dashboard/stats")
+async def get_dashboard_stats():
+    """Get dashboard statistics"""
     try:
-        print(f"DEBUG: Processing fleet analytics for fleet_id: {fleet_id}")
-        print(f"DEBUG: Total vehicles in system: {len(vehicles)}")
+        # Get counts
+        total_vehicles = await vehicle_collection.count_documents({})
+        total_drivers = await driver_collection.count_documents({})
+        total_fleets = await fleet_collection.count_documents({})
+        total_owners = await owner_collection.count_documents({})
+        total_trips = await trip_collection.count_documents({})
+        total_maintenance = await maintenance_collection.count_documents({})
+        total_alerts = await alert_collection.count_documents({})
         
-        # Filter vehicles in this fleet
-        fleet_vins = [v.vin for v in vehicles.values() if v.fleet_id == fleet_id]
-        print(f"DEBUG: Found {len(fleet_vins)} vehicles in fleet {fleet_id}")
-        print(f"DEBUG: Fleet VINs: {fleet_vins}")
+        # Get active vehicles (with Active status)
+        active_vehicles = await vehicle_collection.count_documents({"registration_status": "Active"})
         
-        if not fleet_vins:
-            raise HTTPException(404, "Fleet not found")
-
-        now = datetime.now()
-        active, inactive = 0, 0
-        fuel_levels = []
-        distance = 0.0
-        alert_summary: Dict[str, Dict[str, int]] = {}
-
-        # Alerts in last 24h - ensure timezone consistency
-        now = normalize_datetime(now)
-        cut = now - timedelta(hours=24)
-        for alert in alerts.values():
-            if alert.vin in fleet_vins and normalize_datetime(alert.timestamp) >= cut:
-                alert_summary.setdefault(alert.alert_type.value, {})
-                alert_summary[alert.alert_type.value][alert.severity] = (
-                    alert_summary[alert.alert_type.value].get(alert.severity, 0) + 1
-                )
-
-        for vin in fleet_vins:
-            recs = telemetry_log.get(vin, [])
-            if not recs:
-                inactive += 1
-                continue
-
-            # Get the latest telemetry record
-            try:
-                last = max(recs, key=lambda r: r.timestamp)
-                if normalize_datetime(last.timestamp) >= cut:
-                    active += 1
-                else:
-                    inactive += 1
-
-                # collect fuel/battery (always add the latest fuel level)
-                fuel_levels.append(last.fuel_level)
-            except ValueError as e:
-                print(f"Error processing vehicle {vin}: {e}")
-                inactive += 1
-                continue
-
-            # distance in last 24h
-            recent = [r for r in recs if normalize_datetime(r.timestamp) >= cut]
-            if len(recent) >= 2:
-                odos = [r.odometer for r in recent]
-                distance += max(odos) - min(odos)
-
-        avg_fuel = round(sum(fuel_levels) / len(fuel_levels), 2) if fuel_levels else 0.0
-
+        # Get recent alerts (last 24 hours)
+        yesterday = datetime.utcnow() - timedelta(days=1)
+        recent_alerts = await alert_collection.count_documents({"timestamp": {"$gte": yesterday}})
+        
+        # Calculate average fuel level from recent telemetry
+        recent_telemetry = await telemetry_collection.find(
+            {"timestamp": {"$gte": yesterday}}
+        ).to_list(100)
+        
+        avg_fuel = 0
+        if recent_telemetry:
+            total_fuel = sum(t.get("fuel_level", 0) for t in recent_telemetry)
+            avg_fuel = round(total_fuel / len(recent_telemetry), 1)
+        
         return {
-            "fleet_id": fleet_id,
-            "active_vehicles": active,
-            "inactive_vehicles": inactive,
-            "average_fuel_level": avg_fuel,
-            "distance_last_24h": round(distance, 2),
-            "alert_summary": alert_summary,
+            "totalVehicles": total_vehicles,
+            "totalDrivers": total_drivers,
+            "totalFleets": total_fleets,
+            "totalOwners": total_owners,
+            "totalTrips": total_trips,
+            "totalMaintenance": total_maintenance,
+            "recentAlerts": recent_alerts,
+            "activeVehicles": active_vehicles,
+            "avgFuel": avg_fuel
         }
     except Exception as e:
-        # Log the error for debugging
-        print(f"Error in fleet_analytics for fleet {fleet_id}: {str(e)}")
-        import traceback
-        traceback.print_exc()
-        raise HTTPException(500, f"Internal server error: {str(e)}")
+        raise HTTPException(500, f"Failed to get dashboard stats: {str(e)}")
+
+# ---------------- Health Check ----------------
+@app.get("/health")
+async def health_check():
+    """Health check endpoint"""
+    return {"status": "healthy", "timestamp": datetime.utcnow().isoformat()}

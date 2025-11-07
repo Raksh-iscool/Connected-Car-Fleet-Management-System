@@ -8,7 +8,7 @@ if defined _OLD_CODEPAGE (
     "%SystemRoot%\System32\chcp.com" 65001 > nul
 )
 
-set VIRTUAL_ENV=C:\Users\athar\Documents\VS_Code\motorqq\motorq\venv
+set VIRTUAL_ENV=C:\Users\ravrak\OneDrive\Sem3\intern\dbms\Connected-Car-Fleet-Management-System\venv
 
 if not defined PROMPT set PROMPT=$P$G
 

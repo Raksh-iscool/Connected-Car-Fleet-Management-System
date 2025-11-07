@@ -1,0 +1,18 @@
+# Dependencies and Environments
+venv/
+__pycache__/
+node_modules/
+
+# Next.js Build Artifacts
+.next/
+out/
+npm-debug.log
+
+# Private/Local Configuration
+.env
+.env.local
+.env.*.local
+
+# Operating System
+.DS_Store
+Thumbs.db
