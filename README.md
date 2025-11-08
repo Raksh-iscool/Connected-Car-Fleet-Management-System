@@ -108,11 +108,4 @@ docker compose down --rmi all
     ├── components/
     └── public/
 ```
-Output images
-## 📊 Fleet Dashboard
 
-![Fleet Dashboard](./images/dashboard.png)
-
-## 🚨 Alerts and Telemetry View
-
-![Telemetry View](./images/telemetry.png)
